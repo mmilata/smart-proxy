@@ -2,6 +2,7 @@ require 'net/http'
 require 'net/https'
 require 'uri'
 require 'proxy/log'
+require 'time'
 
 module Proxy::AbrtProxy
   def self.random_alpha_string(length)
@@ -84,11 +85,12 @@ module Proxy::AbrtProxy
     include Proxy::Log
 
     class AggregatedReport
-      attr_accessor :report, :count, :hash
-      def initialize(report, count, hash)
+      attr_accessor :report, :count, :hash, :reported_at
+      def initialize(report, count, hash, reported_at)
         @report = report
         @count = count
         @hash = hash
+        @reported_at = Time.parse reported_at
       end
     end
 
@@ -102,7 +104,7 @@ module Proxy::AbrtProxy
 
       report = json["report"]
       hash = HostReport.duphash report
-      ar = AggregatedReport.new(json["report"], 1, hash)
+      ar = AggregatedReport.new(json["report"], 1, hash, json["reported_at"])
       @reports = [ar]
       # index the array elements by duphash, if they have one
       @by_hash = {}
@@ -117,7 +119,9 @@ module Proxy::AbrtProxy
       other.reports.each do |ar|
         if !ar.hash.nil? && @by_hash.has_key?(ar.hash)
           # we already have this report, just increment the counter
-          @by_hash[ar.hash].count += ar.count
+          found_report = @by_hash[ar.hash]
+          found_report.count += ar.count
+          found_report.reported_at = [found_report.reported_at, ar.reported_at].min
         else
           # we either don't have this report or it has no hash
           @reports << ar
@@ -130,7 +134,7 @@ module Proxy::AbrtProxy
     def send_to_foreman
       foreman_report = create_foreman_report
       logger.debug "Sending #{foreman_report}"
-      Proxy::Request::Reports.new.post_report(foreman_report.to_json)
+      Proxy::Request::ForemanRequest.new.send_request("/api/abrt_reports", foreman_report.to_json)
     end
 
     def unlink
@@ -140,10 +144,12 @@ module Proxy::AbrtProxy
       end
     end
 
-    def self.save(host, report)
+    def self.save(host, report, reported_at=nil)
       # create the spool dir if it does not exist
       FileUtils.mkdir_p HostReport.spooldir
-      on_disk_report = { "host" => host, "report" => report }
+
+      reported_at ||= Time.now.utc
+      on_disk_report = { "host" => host, "report" => report , "reported_at" => reported_at.to_s }
 
       # write report to temporary file
       temp_fname = with_unique_filename "new-" do |temp_fname|
@@ -174,40 +180,25 @@ module Proxy::AbrtProxy
 
     private
 
-    def failed_reports_count
-      @reports.inject(0) { |total,ar| total += ar.count }
-    end
-
-    def report_logs
+    def format_reports
       @reports.collect do |ar|
-        message = ar.report["reason"]
-        message << " (repeated #{ar.count} times)" if ar.count > 1
-        { "log" => { "sources"  => { "source" => "ABRT" },
-                     "messages" => { "message" => message },
-                     "level"    => "err"
-                   }
+        r = {
+          "count"       => ar.count,
+          "reported_at" => ar.reported_at.utc.to_s,
+          "full"        => ar.report
         }
+        r["duphash"] = ar.hash unless ar.hash.nil?
+        r
       end
     end
 
     # http://projects.theforeman.org/projects/foreman/wiki/Json-report-format
     # To be replaced once Foreman understands other report types than from Puppet.
     def create_foreman_report
-      { "report" => {
+      { "abrt_report" => {
             "host"        => @host,
-            "reported_at" => Time.now.utc.to_s,
-            "status"      => { "applied"         => 0,
-                               "restarted"       => 0,
-                               "failed"          => failed_reports_count,
-                               "failed_restarts" => 0,
-                               "skipped"         => 0,
-                               "pending"         => 0
-                             },
-            "metrics"     => { "resources" => { "total" => 0 },
-                               "time"      => { "total" => 0 }
-                             },
-            "logs"        => report_logs
-            }
+            "reports"     => format_reports
+        }
       }
     end
 
